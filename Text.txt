@@ -1,0 +1,720 @@
+
+	private SessionStoreResponse<ProspectFlowData> addDevicesToCart(CartRequest cartRequest, HttpServletRequest httpServletRequest,
+																	HttpServletResponse httpServletResponse,
+																	boolean updateBillingAddressWhenLinesIsEmpty)
+			throws ExecutionException, InterruptedException {
+		SessionStoreResponse<ProspectFlowData> resp = new SessionStoreResponse<ProspectFlowData>();
+		ProspectFlowData prospectFlowData;
+		Optional<ProspectFlowData> retrieveCart = prospectCartUtil.getCartFromSession();
+
+		validateRequestForAgentLinkJourney(cartRequest, retrieveCart);
+
+		retrieveCart = initFlowFor15Gifts(retrieveCart, cartRequest);
+		ProspectFlowData backedUpCart = ProspectCartHelper.copyCart(retrieveCart);
+
+		if(prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_PLANS_FIRST_SET_LINEID) &&
+				cartRequest !=null && StringUtils.isNotBlank(cartRequest.getApproach()) &&
+				StringUtils.equalsIgnoreCase(cartRequest.getApproach(),Constants.PLANS_FIRST)){
+			if(org.apache.commons.collections4.CollectionUtils.isNotEmpty(cartRequest.getLines())){
+				cartRequest.getLines().stream().forEach(line -> {
+					if(Operation.ADD.equals(line.getOperation())){
+						LOGGER.info("setting plans-first approach to request add line");
+						line.setApproach(cartRequest.getApproach());
+					}
+				});
+			}
+
+		}
+
+		if (updateBillingAddressWhenLinesIsEmpty && ObjectUtils.isNotEmpty(cartRequest.getCartMeta().getPdpBillingAddress())) {
+			if (retrieveCart.isPresent() && retrieveCart.get().getOptionalCart().isPresent()) {
+				prospectFlowData = retrieveCart.get();
+				LOGGER.info("updating billingAddress entered in plans page to session");
+				prospectFlowData.setPdpBillingAddress(cartRequest.getCartMeta().getPdpBillingAddress());
+				setDefaultCartDetails(cartRequest, prospectFlowData);
+				prospectCartUtil.updateCartInSession(Optional.of(prospectFlowData));
+				prepareSuccessResponseForBillingAddressUpdate(resp, prospectFlowData);
+			}
+			if (!retrieveCart.isPresent()) {
+				LOGGER.info("updating billingAddress for plans-first flow");
+				prospectFlowData = new ProspectFlowData();
+				AutomationStepsStatus automationStepsStatus = new AutomationStepsStatus();
+				automationStepsStatus.setAutomationStatus(cloudPropertiesConfig.getAutomationStatus());
+				prospectFlowData.setAutomationStepsStatus(automationStepsStatus);
+				prospectFlowData.setCart(new ProspectCart());
+				prospectFlowData.setPdpBillingAddress(cartRequest.getCartMeta().getPdpBillingAddress());
+				setDefaultCartDetails(cartRequest, prospectFlowData);
+				prospectCartUtil.saveCartInSession(prospectFlowData);
+				prepareSuccessResponseForBillingAddressUpdate(resp, prospectFlowData);
+			}
+			return resp;
+		}
+		
+		if (retrieveCart.isPresent() && retrieveCart.get().getOptionalCart().isPresent() && !retrieveCart.get().getCart().isUnifiedCart()) {
+			List<Package> pkgs = new ArrayList<>();
+			for (PackageRequest pkg : cartRequest.getLines()) {
+				Package pack = new Package();
+				pack.setPackageType(pkg.getPackageType());
+				
+				if (ObjectUtils.isNotEmpty(pkg.getDevice())) {
+					if (PackageType.FIVEG.equals(pkg.getPackageType())) {
+						pack.setByor(pkg.getDevice().isByod());
+					} else {
+						pack.setByod(pkg.getDevice().isByod());
+					}		
+				}
+				
+				if(ObjectUtils.isNotEmpty(pkg.getPlan()) && StringUtils.isNotEmpty(pkg.getPlan().getPlanId())){
+					Plan plan = new Plan();
+					plan.setPricePlanCode(pkg.getPlan().getPlanId());
+					pack.setPlan(plan);
+				}
+				pkgs.add(pack);
+			}
+			if (!pkgs.isEmpty()) {
+					LOGGER.info("checking if new requested devices can be added or not - {}", pkgs);
+					if (!ProspectCartHelper.validateCartUpdateAction(retrieveCart.get().getCart(), pkgs,
+							prospectFetchConfigHelper, cartRequest.isAllowMixedCart(), isUserDigitalAgent(cartRequest))) {
+						ServiceStatus status = ProspectCartHelper.errorStatus(Constants.PACKAGE_IMCOMPATIBLE,
+								HttpStatus.SC_FAILED_DEPENDENCY);
+						resp.setStatus(status);
+						return resp;
+					}
+			}
+		}
+		 
+		if (retrieveCart.isPresent()) {
+			prospectFlowData = retrieveCart.get();
+			if (prospectFlowData != null && (prospectFlowData.getAutomationStepsStatus() == null ||
+					ObjectUtils.isEmpty(prospectFlowData.getAutomationStepsStatus().getAutomationStatus()))) {
+				LOGGER.info("addDevicesToCart:: SessionCart exist, missing automation steps, adding to cart");
+				AutomationStepsStatus automationStepsStatus = new AutomationStepsStatus();
+				automationStepsStatus.setAutomationStatus(cloudPropertiesConfig.getAutomationStatus());
+				prospectFlowData.setAutomationStepsStatus(automationStepsStatus);
+			}
+		} else {
+			prospectFlowData = new ProspectFlowData();
+			AutomationStepsStatus automationStepsStatus = new AutomationStepsStatus();
+			automationStepsStatus.setAutomationStatus(cloudPropertiesConfig.getAutomationStatus());
+			prospectFlowData.setAutomationStepsStatus(automationStepsStatus);
+			prospectFlowData.setCart(new ProspectCart());
+		}
+
+		setDefaultCartDetails(cartRequest, prospectFlowData);
+
+		updateExistingUserMeta(cartRequest, prospectFlowData);
+
+		CompletableFuture<SessionStoreResponse<AccountInformation>> addAccountDetailsInCache = null;
+		if(prospectCartUtil.isExistingUserCartMetaInfo(cartRequest.getCartMeta(), prospectFetchConfigHelper.fetchConfigValue(Constants.LOGGEDIN_CLIENT_ID_MBT,Constants.MBT)))
+		{
+			String key = Constants.ECPD_ACCOUNTS_CACHE_KEY+"_"+cartRequest.getCartMeta().getEcpdId()+"_"+cartRequest.getCartMeta().getUserId();
+			EntitlementAcctRetrievalResponse entitlementAcctRetrievalCacheResponse  = fetchEntitlementAcctRetrievalSession(key);
+			LOGGER.info("get entitlementAcctRetrievalCacheResponse : {}", gson.toJson(entitlementAcctRetrievalCacheResponse));
+
+			if (ObjectUtils.isNotEmpty(entitlementAcctRetrievalCacheResponse) && ObjectUtils.isNotEmpty(entitlementAcctRetrievalCacheResponse.getAccountDetails())
+					&& ObjectUtils.isNotEmpty(prospectFlowData.getBusinessInfo()) && StringUtils.isBlank(prospectFlowData.getBusinessInfo().getShellAccountNumber())) {
+					boolean isMultiAccount = entitlementAcctRetrievalCacheResponse.getAccountDetails().size() > 0;
+					LOGGER.info("Existing user updating account number from cache : {}  and number of accounts : {}", entitlementAcctRetrievalCacheResponse.getAccountDetails().get(0).getAccountNumber(), isMultiAccount);
+					boolean isByodRequest = cartRequest.getLines().stream().filter(pkgReq -> !Operation.DELETE.equals(pkgReq.getOperation())).allMatch(x -> null != x.getDevice() && x.getDevice().isByod());
+					if (!(isMultiAccount) || cartRequest.isBuyNow() || cartRequest.getCartMeta().isRecommendedPackage() || isByodRequest || cartRequest.getCartMeta().getShoppingPath().equalsIgnoreCase(Constants.EPBNAO_SHOPPINGPATH)) {
+						prospectFlowData.getBusinessInfo().setShellAccountNumber(entitlementAcctRetrievalCacheResponse.getAccountDetails().get(0).getAccountNumber());
+					}
+					prospectFlowData.getCart().setMultiAccount(isMultiAccount);
+			} else if (ObjectUtils.isEmpty(prospectFlowData.getBusinessInfo())
+							|| StringUtils.isBlank(prospectFlowData.getBusinessInfo().getShellAccountNumber())) {
+				addAccountDetailsInCache = CompletableFuture.supplyAsync(() -> {
+					LOGGER.info("addAccountDetails start {}", gson.toJson(cartRequest.getCartMeta()));
+					return addAccountDetails(cartRequest, httpServletRequest);
+				}, asyncExecutor).exceptionally(ex -> {
+					LOGGER.error("Error while adding AccountDetails ", ex);
+					return null;
+				});
+			}
+		}
+
+		//Not adding accessories and router for MMW BYOReceiverRouter :: VBGHSA-20101
+		if (!cartRequest.getLines().isEmpty() && ObjectUtils.isNotEmpty(cartRequest.getLines().get(0).getDevice())
+				&& ObjectUtils.isEmpty(cartRequest.getLines().get(0).getDevice().getByodInfo())) {
+			addAccessoryAndRouterForMmwCart(cartRequest, prospectFlowData);
+		}
+		String visitorId = CookieUtils.getValueFromCookie(httpServletRequest, Constants.VISIOTR_ID_COOKIE);
+		LOGGER.info("coming in for visitor id  {}", visitorId);
+
+		ProspectFlowData finalProspectFlowData = prospectFlowData;
+		if (prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_PLANS_FIRST_GROUPING_LOGIC) &&
+				cartRequest.getCartMeta() != null && Constants.PLANS_FIRST_FLOW.equals(cartRequest.getCartMeta().getFlow())) {
+			prospectFlowData.getCart().setPlansFirstFlow(true);
+		}
+		/*NFWAFIOS-501 : for GW jointOffer tile*/
+		CompletableFuture<ProspectFlowData> loopQualResponse = null;
+		if (!prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_ASYNC_CALL_TO_LOOPQUAL) && ObjectUtils.isNotEmpty(cartRequest.getCartMeta()) && cartRequest.getCartMeta().isGwJointOfferFlowEnabled()
+				&& ObjectUtils.isNotEmpty(cartRequest.getCartMeta().getPdpBillingAddress()) && StringUtils.isNotBlank(cartRequest.getCartMeta().getPdpBillingAddress().getAddressLine1())) {
+			loopQualResponse = getloopQualAddressDetails(cartRequest, httpServletRequest, httpServletResponse);
+		}
+
+		if(prospectFlowData.getCart().getPackages()!=null && prospectFlowData.getCart().getPackages().size() == 1 && cartRequest.getLines().size() == 1 && Operation.DELETE.equals(cartRequest.getLines().get(0).getOperation())){
+			resp.setStatus(clearCartServiceImpl.clearCart());
+			return resp;
+		}
+
+		//BOVV-150903: update prospectBUlkQualMap
+		if(MapUtils.isNotEmpty(finalProspectFlowData.getProspectBulkLoopQualAddress())){
+			cartRequest.getLines().stream().filter(req-> org.apache.commons.collections4.CollectionUtils.isNotEmpty(req.getBulkAddresses())).forEach(req->updateBulkQualAddressMap(req,finalProspectFlowData));
+		}
+
+		//remove pkgs by groupId
+		cartRequest.getLines().stream().filter(req-> Operation.DELETE.equals(req.getOperation())  && StringUtils.isNotBlank(req.getGroupId()))
+				.forEach(req->clearCartServiceImpl.removePackageByGrpId(req,finalProspectFlowData));
+
+
+		/*In case of UPDATE request of cart - if the deviceCategory is being changed,
+		the package should be deleted in order to avoid any mismatch / incompatibility
+		with the plans & features*/
+//		ProspectFlowData finalProspectCart = prospectFlowData;
+		/*checkDeviceCategoryCompatibility(cartRequest, finalProspectFlowData);*/
+
+		//remove pkgs by packageId
+		cartRequest.getLines().stream().filter(pkgReq -> Operation.DELETE.equals(pkgReq.getOperation()))
+				.forEach(pkgReq -> clearCartServiceImpl.removePackage(pkgReq.getPackageId(), finalProspectFlowData));
+		//remove Delete operation Lines From Cart
+		cartRequest.getLines().removeIf(line -> Operation.DELETE.equals(line.getOperation()));
+		// because above lambda needs a final variable so new variable assigning back
+		prospectFlowData = finalProspectFlowData;
+
+		LOGGER.info("CartCompositeServiceImpl.addDeviceToCart.prospectFlowCart :: 1 : " + gson.toJson(prospectFlowData));
+		if (cartRequest.getLines().stream().anyMatch(pkgReq -> (ObjectUtils.isNotEmpty(pkgReq.getDevice())) ||
+				ObjectUtils.isNotEmpty(pkgReq.getPlan()) || ObjectUtils.isNotEmpty(pkgReq.getTradeIn()))) {
+			prospectFlowData = devicePopulateServiceImpl.populateDetailsInCart(cartRequest.getLines(),
+					prospectFlowData, httpServletRequest, cartRequest.getCartMeta());
+			prospectFlowData = devicePopulateServiceImpl.populateTysAccountDetailsInCart(cartRequest,
+					prospectFlowData);
+			LOGGER.info("prospectFlowData after adding the devices {}", gson.toJson(prospectFlowData));
+		}
+
+		if (prospectFlowData.getCart() != null && cartRequest.getLines() != null
+				&& cartRequest.getLines().stream().anyMatch(line -> PackageType.IOT.equals(line.getPackageType()))) {
+			List<String> clientIdList = prospectFetchConfigHelper.getConfigList(Constants.ENABLE_NEW_MARKETPLACE_FLOW_BASEDON_CLIENTID);
+			String clientId = cartRequest.getCartMeta().getClientId();
+			if(StringUtils.isEmpty(cartRequest.getCartMeta().getClientId())){
+				clientId = prospectFlowData.getClientId();
+			}
+			if(prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_MARKETPLACE_PRODUCT_NEW_FLOW) && !CollectionUtils.isEmpty(clientIdList) && cartRequest.getCartMeta()!=null &&
+					clientIdList.contains(clientId)) {
+				prospectFlowData = devicePopulateServiceImpl.populateMarketPlaceDetailsInCart(prospectFlowData, cartRequest.getLines(), cartRequest.getCartMeta());
+			}else {
+				prospectFlowData = devicePopulateServiceImpl.populateBuSSDetailsInCart(prospectFlowData, cartRequest.getLines(), cartRequest.getCartMeta());
+			}
+		}
+
+		/*if (prospectFlowData.getCart() != null && cartRequest.getLines() != null
+				&& cartRequest.getLines().stream().anyMatch(line -> PackageType.IOT.equals(line.getPackageType()) && line.isMarketPlaceProduct())) {
+			prospectFlowData = devicePopulateServiceImpl.populateMarketPlaceProductsInCart(prospectFlowData, cartRequest);
+		}*/
+
+		/*Logic for rental Devices - VBC*/
+
+		accessoriesPopulateService.mapDaasAccessoriesToCart(prospectFlowData , new VbcPlanAndFeatureRequest());
+		if(cartRequest.getLines().stream().anyMatch(req -> PackageType.RENTAL_REGULAR.equals(req.getPackageType()) && req.getAccessories()==null)){
+			LOGGER.info("updating sessioncart for rental packages with plans,features,totals and ordersummary");
+			/*logic to add VBC plan & feature & includedAccessories to cart*/
+			List<PackageRequest> requestPackages = cartRequest.getLines().stream().filter(req -> null !=req.getOperation() && null!=req.getDevice() && Operation.ADD.equals(req.getOperation())).collect(Collectors.toList());
+			if(!CollectionUtils.isEmpty(requestPackages)){
+				prospectFlowData =	planPopulateServiceImpl.populatePlanAndFeaturesForRentalDevicesInCart(requestPackages, prospectFlowData, resp);
+				if (prospectFlowData.getCart().getOptionalPackages().isPresent()) {
+					planPopulateServiceImpl.populateFeaturesSectionForDaas(prospectFlowData.getCart().getPackages());
+				}
+			}
+
+			/*logic to update VBC includedAccessories when line operation is UPDATEBULKQTY*/
+			/*List<PackageRequest> bulkQtyPackages = cartRequest.getLines().stream().filter(req -> null != req.getOperation() && Operation.UPDATEBULKQTY.equals(req.getOperation())).collect(Collectors.toList());
+			if(org.apache.commons.collections4.CollectionUtils.isNotEmpty(bulkQtyPackages)){
+				VbcPlanAndFeatureRequest vbcPlanAndFeatureRequest = ProspectCartHelper.createVbcPlanFeatureRequest(bulkQtyPackages,prospectFlowData);
+				accessoriesPopulateService.mapDaasAccessoriesToCart(prospectFlowData, vbcPlanAndFeatureRequest);
+			}*/
+
+			/*logic to add or delete VBC features when line Operation is Not Add*/
+			List<PackageRequest> featurePackages = cartRequest.getLines().stream().filter(req -> !Operation.ADD.equals(req.getOperation()) && !CollectionUtils.isEmpty(req.getFeatures())).collect(Collectors.toList());
+			if(!CollectionUtils.isEmpty(featurePackages)){
+				prospectFlowData = featuresPopulateServiceImpl.populateDetailsInCart(featurePackages,
+						prospectFlowData, httpServletRequest, cartRequest.getCartMeta());
+			}
+
+			/*populate accesories to cart*/
+			poulateAccessories(prospectFlowData,cartRequest,httpServletRequest);
+
+			if(prospectFlowData.getOptionalCart().isPresent() && prospectFlowData.getCart().getOptionalPackages().isPresent()){
+				planPopulateServiceImpl.populateTierNameForDaas(prospectFlowData.getCart().getPackages());
+			}
+			TotalAmounts totalAmounts = ProspectCartHelper.updateTotal(prospectFlowData,false,prospectFetchConfigHelper);
+			prospectFlowData.setTotalAmounts(totalAmounts);
+			prospectCartServiceImpl.mapOrderSummary(prospectFlowData,Constants.MONTH_TO_MONTH);
+			ProspectCartHelper.updateDeviceGrouping(prospectFlowData, httpServletRequest, prospectFetchConfigHelper);
+			prospectCartUtil.updateCartInSession(Optional.of(prospectFlowData));
+			if(null == resp.getStatus()){
+				ServiceStatus serviceStatus = new ServiceStatus();
+				serviceStatus.setSuccess(true);
+				serviceStatus.setMessage("Cart updated successfully");
+				serviceStatus.setStatusMessage("successfully updated");
+				serviceStatus.setStatusCode(HttpStatus.SC_OK);
+				resp.setStatus(serviceStatus);
+			}
+			resp.setResponse(prospectFlowData);
+			return resp;
+		}
+
+		if ((Objects.nonNull(prospectFlowData.getDspData()) || cartRequest.getLines().stream()
+				.anyMatch(pkgReq -> (ObjectUtils.isNotEmpty(pkgReq.getPlan()))
+						|| PackageType.ONETALK.equals(pkgReq.getPackageType()))
+						|| (prospectFlowData.getCart()!=null && prospectFlowData.getCart().getFlow()!=null && prospectFlowData.getCart().getFlow().equals(Constants.PLANS_FIRST_FLOW))
+				&& monetizationCartServiceImpl.isCartPackagesPresent(prospectFlowData))) {
+				if(StringUtils.isNotEmpty(cartRequest.getCartMeta().getFlow())&& Constants.PLANS_FIRST_FLOW.equalsIgnoreCase(cartRequest.getCartMeta().getFlow())){
+					prospectFlowData.getCart().setFlow( Constants.PLANS_FIRST_FLOW);
+				}
+				prospectFlowData = planPopulateServiceImpl.populateDetailsInCart(cartRequest.getLines(), prospectFlowData, httpServletRequest, cartRequest.getCartMeta());
+
+			LOGGER.info("prospectFlowData after adding the plans {}", gson.toJson(prospectFlowData));
+		}
+		
+		if(prospectFlowData.checkTysPackages()) {
+			prospectFlowData = featuresPopulateServiceImpl.populateDetailsInCart(cartRequest.getLines(),
+					prospectFlowData, httpServletRequest, cartRequest.getCartMeta());
+			
+		}
+		if ((cartRequest.getLines().stream().anyMatch(pkgReq -> !CollectionUtils.isEmpty((pkgReq.getFeatures())))
+				&& monetizationCartServiceImpl.isCartPackagesPresent(prospectFlowData))
+				|| isFeatureDescNotPresentForAnyPackageInCart(prospectFlowData)) {
+			String flow = cartRequest.getCartMeta().getFlow()!=null?cartRequest.getCartMeta().getFlow():null;
+			cartRequest.getCartMeta().setFlow(cartRequest.getApproach());
+			prospectFlowData = featuresPopulateServiceImpl.populateDetailsInCart(cartRequest.getLines(),
+					prospectFlowData, httpServletRequest, cartRequest.getCartMeta());
+			cartRequest.getCartMeta().setFlow(flow);
+			LOGGER.info("prospectFlowData after adding the features {}", gson.toJson(prospectFlowData));
+		}
+
+		/*populate accessories in cart*/
+		poulateAccessories(prospectFlowData,cartRequest,httpServletRequest);
+
+
+		if (prospectFlowData != null && prospectFlowData.getCart() != null
+				&& prospectFlowData.getCart().getOptionalPackages().isPresent()) {
+			Map<String, Package> pkgMap = prospectFlowData.getCart().getPackages();
+			prospectFlowData.getCart().setOneTalkLACFtr(prospectFetchConfigHelper.fetchConfigValue(Constants.PROSPECT_ONETALK_FEATUREID_CONF,Constants.DEFAULT_PROSPECT_ONETALK_FEATUREID));
+			boolean isStrikeThroughPricingEnabled = monetizationCartServiceImpl
+					.isConfigFlagEnabled(Constants.PROSPECT_ENABLE_STRIKE_THROUGH_PRICING);
+			ServiceStatus pricingUpdateStatus = ProspectCartHelper.updatePackagePricing(pkgMap, pricingDelegator,
+					isStrikeThroughPricingEnabled,prospectFetchConfigHelper, cartRequest.getCartMeta(), prospectCartUtil.isExistingUserCartMetaInfo(cartRequest.getCartMeta(), prospectFetchConfigHelper.fetchConfigValue(Constants.LOGGEDIN_CLIENT_ID_MBT,Constants.MBT)));
+			if (pricingUpdateStatus.isSuccess()) {
+				Map<String, List<Promotion>> packagepromos = new HashMap<String,List<Promotion>>();
+				pricingUpdateStatus.setMessage("Cart updated successfully");
+				pricingUpdateStatus.setStatusCode(HttpStatus.SC_OK);
+				if (pkgMap.values().stream().anyMatch(p -> (PackageType.FOURG.equals(p.getPackageType()) ||
+						PackageType.FIVEG.equals(p.getPackageType())))) {
+					if (cartRequest.getLines().stream().anyMatch(pkgReq -> ObjectUtils.isEmpty(pkgReq.getDevice()))) {
+						ServiceStatus planPricingUpdateStatus = updatePlanPricing(pkgMap, cartRequest.getCartMeta());
+						resp.setStatus(planPricingUpdateStatus);
+					}
+					
+					if (prospectFetchConfigHelper.isConfigEnabled(Constants.ADDUPDATECARTOPTIMISATION)
+							&& isBuePlanCacheDataAvailable(cartRequest, prospectFlowData).get()) {
+						LOGGER.info("going to populate plan discounts from buePlanOffers cache ");
+						ProspectFlowData finalPfd = prospectFlowData;
+						updatePromoResponseFromCache(cartRequest, finalPfd);
+						prospectFlowData = finalPfd;  
+					} else {
+						planPromoService.fetchPromotions(prospectFlowData, true);
+					}
+				}
+			}
+			if(ObjectUtils.isEmpty(pkgMap)) {
+				pricingUpdateStatus.setSuccess(true);
+				pricingUpdateStatus.setMessage("Cart updated successfully");
+				pricingUpdateStatus.setStatusMessage("successfully updated");
+				pricingUpdateStatus.setStatusCode(HttpStatus.SC_OK);
+			}
+			resp.setStatus(pricingUpdateStatus);
+		}
+		//update grouping logic for devices
+		ProspectCartHelper.updateDeviceGrouping(prospectFlowData, httpServletRequest, prospectFetchConfigHelper);
+		if (prospectFlowData != null && prospectFlowData.getCart() != null
+				&& prospectFlowData.getCart().getOptionalPackages().isPresent()
+				&& prospectFlowData.getCart().getPackages().values().stream()
+						.anyMatch(pckg -> PackageType.FOURG.equals(pckg.getPackageType())
+								|| PackageType.FIVEG.equals(pckg.getPackageType()))) {
+			if (prospectFetchConfigHelper.isConfigEnabled(Constants.ADDUPDATECARTOPTIMISATION)
+					&& IsRouterCachePresent(prospectFlowData, cartRequest).get()) {
+
+				ProspectFlowData fnlProspectFlowData = prospectFlowData;
+
+				prospectFlowData.getCart().getPackages().values().stream().forEach((pack) -> {
+					try {
+						com.vzw.mybiz.utilities.prospect.domain.Offers offer = pack.getOffers() != null
+								? pack.getOffers()
+								: new Offers();
+						List<SbdOffer> sbdOffers = new ArrayList<>();
+						//apply sbd offer for stark receiver - VBGHSA-20101
+						boolean isReceiver = StringUtils.isNotBlank(pack.getDeviceSku())
+								&& (pack.getDeviceSku().equals(prospectFetchConfigHelper.fetchConfigValue(Constants.PROSPECT_MWW_STARK_RECEIVER_SKU_CONF))
+									|| StringUtils.equalsIgnoreCase(pack.getDeviceSku(),prospectFetchConfigHelper.fetchConfigValue(Constants.PROSPECT_TW_RECEIVER_SKU)));
+						String planId = pack.getPlan()!=null ? pack.getPlan().getPricePlanCode():null;
+						FiveGRouterResponse cacheRouterResponse = getResponseFromCache(cartRequest,
+								planId ,isReceiver);
+						LOGGER.info("Fetched Cache Router Response {} using cache key ",
+								gson.toJson(cacheRouterResponse));
+						if (cacheRouterResponse != null) {
+							if (Constants.MONTH_TO_MONTH.equalsIgnoreCase(pack.getPriceType())) {
+								cacheRouterResponse
+										.getDeviceList().stream().filter(device -> StringUtils
+												.equalsIgnoreCase(device.getDeviceId(), pack.getDeviceId()))
+										.forEach((skulist) -> {
+											skulist.getSkulist().stream().filter(sku -> StringUtils
+													.equalsIgnoreCase(sku.getSku(), pack.getDeviceSku()))
+													.forEach((pricingDetails) -> {
+														pricingDetails.getPricingDetails().getDevicePayments().stream()
+																.filter((installments) -> pack.getTenure()
+																		.compareTo(BigDecimal.valueOf(installments
+																				.getNofInstallements())) == 0)
+																.forEach(installment -> {
+																	if(ObjectUtils.isNotEmpty(installment.getSbdOffer()))
+																		sbdOffers.add(installment.getSbdOffer());
+																});
+													});
+										});
+							}
+							if (Constants.RETAIL.equalsIgnoreCase(pack.getPriceType())) {
+								cacheRouterResponse
+										.getDeviceList().stream().filter(device -> StringUtils
+												.equalsIgnoreCase(device.getDeviceId(), pack.getDeviceId()))
+										.forEach((skulist) -> {
+											skulist.getSkulist().stream().filter(sku -> StringUtils
+													.equalsIgnoreCase(sku.getSku(), pack.getDeviceSku()))
+													.forEach((pricingDetails) -> {
+														pricingDetails.getPricingDetails().getZeroYear().getSbdOffer();
+													});
+										});
+							}
+						}
+						offer.setSbdOffer(sbdOffers);
+						pack.setOffers(offer);
+						Phone phone = new Phone();
+						phone.setSbdOffer(sbdOffers);
+						ProspectCartHelper.updateSbdOfferPrice(phone, pack, fnlProspectFlowData,
+								new AtomicBoolean(true));
+					} catch (Exception e) {
+						LOGGER.error("Exception has occured while fetching the offer details from cache Response "+ e.getMessage(), e);
+					}
+				});
+
+				if ((prospectFlowData.getCart().isMwwCart() || prospectFlowData.getCart().isTwCart()) && !prospectFlowData.getCart().isCbandCart()&&fnlProspectFlowData.getCart().getAccessories()!=null) {
+					Offers offers = new Offers();
+					Set<String> planIds = new HashSet<>();
+					if(ObjectUtils.isNotEmpty(prospectFlowData.getCart().getPackages())) {
+						prospectFlowData.getCart().getPackages().values().stream().forEach(pack -> {
+							planIds.add(pack.getPlan().getPricePlanCode());
+						});
+					}
+
+					planIds.stream().forEach(planId -> {
+						FiveGRouterResponse mmwCacheRouterResponse = getResponseFromCache(cartRequest, planId, false);
+						LOGGER.info("mmwCacheRouterResponse for the Accessories is {}",
+								gson.toJson(mmwCacheRouterResponse));
+						fnlProspectFlowData.getCart().getAccessories().values().stream().forEach(accessories -> {
+							mmwCacheRouterResponse.getDeviceList().get(0).getSkulist().stream().filter(
+									acc -> StringUtils.equalsIgnoreCase(acc.getSku(), accessories.getAccessoryId()))
+									.forEach(pricingDetails -> {
+										SedOffer sedOffer = pricingDetails.getPricingDetails().getZeroYear()
+												.getSedOffer();
+										if (sedOffer != null) {
+											offers.setSedOffer(sedOffer);
+											accessories.setOffers(offers);
+										}
+										BigDecimal itemRetailPrice = accessories.getItemPriceWithOutDiscount();
+										BigDecimal diffItemRetailPrice =sedOffer!=null? itemRetailPrice
+												.subtract(new BigDecimal(sedOffer.getOfferAmount()))
+												.setScale(2, RoundingMode.HALF_UP):itemRetailPrice.setScale(2, RoundingMode.HALF_UP);
+										BigDecimal accQty = new BigDecimal(accessories.getQuantity());
+										accessories.setItemPrice(
+												diffItemRetailPrice.divide(accQty, 2, RoundingMode.HALF_UP));
+										accessories.setItemRetailPrice(itemRetailPrice);
+									});
+						});
+					});
+				}
+				prospectFlowData = fnlProspectFlowData;
+				LOGGER.info("PFD after setting SBD and SED Offer details using cache values is {} ",
+						gson.toJson(prospectFlowData));
+			} else {
+				prospectCartServiceImpl.updateOfferforaddCart(prospectFlowData, null, null);
+			}
+		}
+
+		if(prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_UPDATE_GUIDED_PROMO_OFFER_PRICE)){
+			try{
+            boolean isPlanRequest = cartRequest.getLines().stream().anyMatch(pkgreq -> ObjectUtils.isNotEmpty(pkgreq.getPlan())&& StringUtils.isNotBlank(pkgreq.getPlan().getPlanId()));
+			boolean is4gor5gPkgRequest = cartRequest.getLines().stream().anyMatch(pkgreq->ObjectUtils.isNotEmpty(pkgreq.getPackageType()) && (pkgreq.getPackageType().equals(PackageType.FOURG) || pkgreq.getPackageType().equals(PackageType.FIVEG)));
+            if(isPlanRequest && !is4gor5gPkgRequest){
+                 LOGGER.info("inside ENABLE_UPDATE_GUIDED_PROMO_OFFER_PRICE");
+                if (prospectFlowData.isDiscAmountPresentInCart()) {
+                    resetDiscountAmounts(prospectFlowData);
+                }
+                prospectFlowData.getOptionalCart().ifPresent(prospectCart -> {
+                    prospectCart.getOptionalPackages().ifPresent(packageMap->{
+                    	packageMap.entrySet().stream().forEach(e ->{
+                    		cartRequest.getLines().stream().forEach(cartReq ->{
+                                if(cartReq.getPlan().isPromoEligible() && ObjectUtils.isNotEmpty(cartReq.getPackageId()) && cartReq.getPackageId().equalsIgnoreCase(e.getKey())
+                                		&& ObjectUtils.isNotEmpty(e.getValue().getGuidedPromoOfferDetails())
+                                        && StringUtils.isNotBlank(e.getValue().getGuidedPromoOfferDetails().getOfferId())){
+                                	 updateOfferPrice(e.getValue(), finalProspectFlowData);
+                                }
+                    	});
+
+                        });
+                    });
+                });
+            }
+		}catch (Exception e){
+			LOGGER.error("Error while updating Discount Offer Price"+ e.getMessage(), e);
+		}
+		}
+		TotalAmounts totalAmounts = ProspectCartHelper.updateTotal(prospectFlowData, Boolean.FALSE,prospectFetchConfigHelper);
+		prospectFlowData.setTotalAmounts(totalAmounts);
+		prospectFlowData.setVisitorId(visitorId);
+		prospectFlowData.setAccessoryEnabled(prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_ONETALK_ACCESSORY_CONF));
+		setBackOrderStartDate(prospectFlowData);
+		//amex offer changes for react flows
+		mapAddendaCodeForAmexOffersReact(prospectFlowData,cartRequest);
+
+		LOGGER.info("SessionCart before setting MyLink details: {}",gson.toJson(prospectFlowData));
+		/* story POLPROS-11 */
+		if(cartRequest.isFromMyLinkDealsPage() && ObjectUtils.isNotEmpty(cartRequest.getSalesRepDetails())){
+			prospectFlowData.setSalesRepDetails(cartRequest.getSalesRepDetails());
+			prospectFlowData.setFromMyLinkDealsPage(cartRequest.isFromMyLinkDealsPage());
+			//if i2b channel
+			boolean i2bChannel = cartRequest.getSalesRepDetails().getCmpCode().contains(Constants.INDIRECT_CHANNEL);
+			if(StringUtils.isNotBlank(cartRequest.getSalesRepDetails().getCmpCode()) && i2bChannel){
+				prospectFlowData.setI2bChannel(true);
+				prospectFlowData.setSsoId(cartRequest.getSalesRepDetails().getRepSSO());
+				if(ObjectUtils.isNotEmpty(prospectFlowData.getBusinessInfo()) && ObjectUtils.isNotEmpty(prospectFlowData.getBusinessInfo().getAddress()) && prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_OVERRIDE_MYLINK_LOC_FOR_INDIRECT_CHANNEL)) {
+					prospectFlowData.getBusinessInfo().getAddress().setLocationCode(cartRequest.getSalesRepDetails().getLocationCode());
+				}
+			}
+
+			if(!i2bChannel && !prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_OVERRIDE_MYLINK_LOC_FOR_B2B_RETAIL_CHANNEL)){
+				//ovveride salesrep locationcode with prospect-automation code for b2b/RETAIL channels
+				prospectFlowData.getSalesRepDetails().setLocationCode(prospectFetchConfigHelper.fetchConfigValue(Constants.PROSPECT_LOCATION_CODE));
+			}
+			//setting salesrepId to pass it in submitorder xml
+			prospectFlowData.setSalesRepId(cartRequest.getSalesRepDetails().getRepId());
+		}
+
+		if( cartRequest.isFromAgentLinkPage() && StringUtils.isNotBlank(cartRequest.getAgentLocationCode()) &&
+				StringUtils.isNotBlank(cartRequest.getAgentOutletId()))
+		{
+			prospectFlowData.setFromAgentLinkPage(cartRequest.isFromAgentLinkPage());
+
+			if(prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_OVERRIDE_OUTLET_ID_AGENT_LINK)){
+				prospectFlowData.getCart().setOutletId(cartRequest.getAgentOutletId());
+			}
+			if(StringUtils.isNotBlank(cartRequest.getAgentName())){
+				SalesRepDetails salesRepDetails = new SalesRepDetails();
+				salesRepDetails.setAgentName(cartRequest.getAgentName());
+				prospectFlowData.setSalesRepDetails(salesRepDetails);
+			}
+			//POLPROS-535
+			if(StringUtils.isNotBlank(cartRequest.getTier2AgencyName())){
+				prospectFlowData.getCart().setTier2AgencyName(cartRequest.getTier2AgencyName());
+			}
+			if(prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_OVERRIDE_AGENT_LINK) &&
+					ObjectUtils.isNotEmpty(prospectFlowData.getBusinessInfo()) &&
+					ObjectUtils.isNotEmpty(prospectFlowData.getBusinessInfo().getAddress())) {
+				prospectFlowData.getBusinessInfo().getAddress().setLocationCode(cartRequest.getAgentLocationCode());
+			}
+		}
+
+		if(!prospectFlowData.isFwaBundleTabSelected()) {
+			prospectFlowData.setFwaBundleTabSelected(cartRequest.isFwaBundleSelected());
+		}
+
+		if (cartRequest.getCartMeta() != null && StringUtils.isNotBlank(cartRequest.getCartMeta().getEmail())) {
+			LOGGER.info("Email entered in pdp is :: {}", cartRequest.getCartMeta().getEmail());
+			prospectFlowData.setPdpEmail(cartRequest.getCartMeta().getEmail());
+		}
+
+		String prospectThrottle = CookieUtils.getValueFromCookie(httpServletRequest, Constants.PROSPECT_THROTTLE);
+		if ((StringUtils.containsIgnoreCase(prospectThrottle, Constants.PROSPECT_ENABLE_WIRELESS_BUSPRODUCTS) || prospectFetchConfigHelper.isConfigEnabled(Constants.PROSPECT_SHOW_BUSS_PRODUCTS))
+				&& prospectFlowData.getCart() != null && prospectFlowData.getCart().getPackages() != null
+				&& prospectFlowData.getCart().getPackages().entrySet().stream().anyMatch(pkg -> PackageType.REGULAR.equals(pkg.getValue().getPackageType()))
+				&& !prospectFlowData.getCart().isDigitalQuote() && !prospectFlowData.getCart().isReviewQuote()) {
+			prospectFlowData.setShowBussProducts(Boolean.TRUE);
+		}
+		else if ((StringUtils.containsIgnoreCase(prospectThrottle, Constants.PROSPECT_ENABLE_FWA_BUSPRODUCTS) || prospectFetchConfigHelper.isConfigEnabled(Constants.PROSPECT_SHOW_BUSS_PRODUCTS_4G_5G))
+				&& prospectFlowData.getCart() != null && prospectFlowData.getCart().getPackages() != null
+				&& prospectFlowData.getCart().getPackages().entrySet().stream().anyMatch(pkg -> PackageType.FOURG.equals(pkg.getValue().getPackageType()) || PackageType.FIVEG.equals(pkg.getValue().getPackageType()))
+				&& !prospectFlowData.getCart().isDigitalQuote() && !prospectFlowData.getCart().isReviewQuote()) {
+			prospectFlowData.setShowBussProducts(Boolean.TRUE);
+		} else {
+			prospectFlowData.setShowBussProducts(Boolean.FALSE);
+		}
+
+
+		if (prospectFetchConfigHelper.isConfigEnabled(Constants.PROSPECT_SET_PDPADDRESS_AS_BILLINGADDRESS) && ObjectUtils.isNotEmpty(cartRequest.getCartMeta())
+				&& ObjectUtils.isNotEmpty(cartRequest.getCartMeta().getPdpBillingAddress())) {
+			prospectFlowData.setPdpBillingAddress(cartRequest.getCartMeta().getPdpBillingAddress());
+		}
+
+		if (prospectFlowData.getCart() != null && !MapUtils.isEmpty(prospectFlowData.getCart().getPackages())
+				&& prospectFlowData.getCart().getPackages().entrySet().stream().allMatch(pkg -> PackageType.IOT.equals(pkg.getValue().getPackageType()))
+				&& !prospectFlowData.getCart().isReviewQuote() && !prospectFlowData.getCart().isDigitalQuote()) {
+			prospectFlowData.setStandAloneBuSS(Boolean.TRUE);
+		} else {
+			prospectFlowData.setStandAloneBuSS(Boolean.FALSE);
+		}
+
+		LOGGER.info("addDevicesToCart:Adding Guided Promo in Session Cart");
+		prospectCartServiceImpl.updateGuidedPromoOfferWithProspectFlowData(prospectFlowData,cartRequest);
+		ProspectFlowData finalSessionCart = prospectFlowData;
+		cartRequest.getLines().stream().forEach(line -> {
+			if (ObjectUtils.isNotEmpty(finalSessionCart.getCart()) && ObjectUtils.isNotEmpty(finalSessionCart.getCart().getPackages())) {
+				finalSessionCart.getCart().getPackages().values().stream().forEach(pack -> {
+					if (line.isEnableTradeinOfferToggle() && pack.getDeviceSku().equalsIgnoreCase(line.getDevice().getDeviceSku()) && prospectFetchConfigHelper.isConfigEnabled(Constants.PROSPECT_MOCK_TRADEIN_OFFER) && pack.getTradeinPromoOfferDetails() != null) {
+						updateTradeinDiscountAmount(pack, line);
+					}
+					if (pack.getTradeinPromoOfferDetails() == null && prospectFetchConfigHelper.isConfigEnabled(Constants.PROSPECT_MOCK_TRADEIN_OFFER)) {
+						pack.setTradInInfo(null);
+					}
+				});
+			}
+		});
+		
+		prospectCartServiceImpl.mapOrderSummary(prospectFlowData,Constants.MONTH_TO_MONTH);
+		if(prospectFlowData.getCart().isMwwCart() && prospectFetchConfigHelper.isConfigEnabled(Constants.PROSPECT_MMW_TO_4GLTE_ENABLED) &&
+				!ProspectCartHelper.is5GMMWPlanPresent(prospectFlowData.getCart().getPackages(), prospectFetchConfigHelper)){
+			LOGGER.info("Converting 5G MMW cart to 4G LTE");
+			prospectFlowData.getCart().setMwwCart(false);
+		}
+
+		//  check for MixedCartWirelessJO Eligibility
+		if(prospectFlowData.getOptionalCart().isPresent() && prospectFlowData.getOptionalCart().get().getOptionalPackages().isPresent())
+			checkMixedCartWirelessJOEligibility(prospectFlowData);
+
+
+		if(!prospectFetchConfigHelper.isConfigEnabled(Constants.ENABLE_ASYNC_CALL_TO_LOOPQUAL) && cartRequest.getCartMeta().isGwJointOfferFlowEnabled() && ObjectUtils.isNotEmpty(loopQualResponse)) {
+			CompletableFuture.allOf(loopQualResponse).join();
+			if (loopQualResponse != null && ObjectUtils.isNotEmpty(loopQualResponse.get()) && ObjectUtils.isNotEmpty(loopQualResponse.get().getProspect5gLoopQualAddress())) {
+				prospectFlowData.setProspect5gLoopQualAddress(loopQualResponse.get().getProspect5gLoopQualAddress());
+			}
+		}
+		if(ObjectUtils.isNotEmpty(prospectFlowData.getCart().getPackages())) {
+			List<Map.Entry<String, Package>> entryList = new ArrayList<>(prospectFlowData.getCart().getPackages().entrySet());
+			entryList.sort(Comparator.comparingInt((Map.Entry<String, Package> entry) -> entry.getValue().getSortSequence()));
+			Map<String, Package> sortedMap = new LinkedHashMap<>();
+			for (Map.Entry<String, Package> entry : entryList) {
+				sortedMap.put(entry.getKey(), entry.getValue());
+			}
+			prospectFlowData.getCart().setPackages(sortedMap);
+		}
+		if(StringUtils.isNotBlank(cartRequest.getCartMeta().getEcpdId()) &&
+				StringUtils.equalsIgnoreCase(prospectFetchConfigHelper.fetchConfigValue(Constants.LOGGEDIN_CLIENT_ID_MBT, Constants.MBT), cartRequest.getCartMeta().getClientId()) &&
+				ObjectUtils.isNotEmpty(addAccountDetailsInCache) && ObjectUtils.isNotEmpty(prospectFlowData.getBusinessInfo()) &&
+				StringUtils.isBlank(prospectFlowData.getBusinessInfo().getShellAccountNumber())){
+			SessionStoreResponse<AccountInformation> accountdetails =	addAccountDetailsInCache.get();
+			LOGGER.info("Existing user account details: {}",gson.toJson(accountdetails));
+			if(ObjectUtils.isNotEmpty(accountdetails) && ObjectUtils.isNotEmpty(accountdetails.getResponse()) && StringUtils.isNotBlank(accountdetails.getResponse().getAccountNumber())){
+				LOGGER.info("Existing user updating account number : {}  and isMultiaccount : {}",accountdetails.getResponse().getAccountNumber(), accountdetails.getResponse().getIsMultiAccount());
+				boolean isByodRequest = cartRequest.getLines().stream().filter(pkgReq -> !Operation.DELETE.equals(pkgReq.getOperation())).allMatch(x -> null != x.getDevice() && x.getDevice().isByod());
+				if(!accountdetails.getResponse().getIsMultiAccount() || cartRequest.isBuyNow() || cartRequest.getCartMeta().isRecommendedPackage() || isByodRequest || cartRequest.getCartMeta().getShoppingPath().equalsIgnoreCase(Constants.EPBNAO_SHOPPINGPATH)) {
+					prospectFlowData.getBusinessInfo().setShellAccountNumber(accountdetails.getResponse().getAccountNumber());
+				}
+				prospectFlowData.getCart().setMultiAccount(accountdetails.getResponse().getIsMultiAccount());
+			}
+		}
+		prospectCartUtil.saveCartInSession(prospectFlowData);
+
+		// Skipping the tax calculation call when addOrUpdateCart optimization is enabled
+		if (!prospectFetchConfigHelper.isConfigEnabled(Constants.ADDUPDATECARTOPTIMISATION)) {
+			LOGGER.info("going to calculate taxes now ");
+			monetizationCartServiceImpl.updateTaxInCart(prospectFlowData);
+		}
+        CompletableFuture.runAsync(() -> clearByodKeysFromSessionCache(cartRequest, httpServletRequest), asyncExecutor).exceptionally(ex -> {
+            LOGGER.error("Error while Deleting the Session cache", ex);
+            throw new RuntimeException(ex.getMessage());
+        });
+		CompletableFuture.runAsync(() -> clearFeatureCache(cartRequest), asyncExecutor).exceptionally(ex -> {
+			LOGGER.error("Error while Deleting the Feature cache", ex);
+			throw new RuntimeException(ex.getMessage());
+		});
+
+//		if(ObjectUtils.isNotEmpty(cartRequest.getCartMeta()) && StringUtils.isNotBlank(cartRequest.getCartMeta().getEcpdId()) &&
+//				(ObjectUtils.isNotEmpty(prospectFlowData.getBusinessInfo())
+//						&& StringUtils.isNotBlank(prospectFlowData.getBusinessInfo().getShellAccountNumber()))) {
+//			ProspectFlowData prospectFlowDataTemp = prospectFlowData;
+//			CompletableFuture.runAsync(() -> fetchAccountByAccountNumber(cartRequest, prospectFlowDataTemp.getBusinessInfo().getShellAccountNumber()), asyncExecutor).exceptionally(ex -> {
+//				LOGGER.error("Error while calling fetchAccountByAccountNumber", ex);
+//				throw new RuntimeException(ex.getMessage());
+//			});
+//		}
+
+		if(!Constants.VENDOR_15GIFTS.equalsIgnoreCase(prospectFlowData.getVendorName())) {
+			resp.setResponse(prospectFlowData);
+		}
+		if (prospectFetchConfigHelper.isConfigEnabled(Constants.PROSPECT_FEATURE_BOOKSHELF_ENABLED)) {
+			if ((Objects.nonNull(prospectFlowData.getDspData()) || (cartRequest.getLines().stream()
+					.anyMatch(pkgReq -> (ObjectUtils.isNotEmpty(pkgReq.getPlan()))
+							|| PackageType.ONETALK.equals(pkgReq.getPackageType())) && prospectFlowData.getCart() != null
+					&& !StringUtils.isNotEmpty(prospectFlowData.getCart().getFlow()))
+					|| (prospectFlowData.getCart() != null && prospectFlowData.getCart().getFlow() != null &&
+					prospectFlowData.getCart().getFlow().equals(Constants.PLANS_FIRST_FLOW) && cartRequest.getLines().stream()
+					.anyMatch(pkgReq -> (ObjectUtils.isNotEmpty(pkgReq.getDevice()))))
+			) && monetizationCartServiceImpl.isCartPackagesPresent(prospectFlowData)) {
+				String bookShelfCacheKey = ProspectCartHelper.generateBookShelfCacheKey(prospectFlowData);
+				RetrivePriceOfferResponse vpeResp = promotionCache.getFromCache(bookShelfCacheKey, RetrivePriceOfferResponse.class);
+				if (vpeResp == null) {
+					LOGGER.info("saving RetrivePriceOfferResponse into cache");
+					vpeResp = planPromoService.fetchPlanFeaturePromotions(prospectFlowData);
+					promotionCache.putToCache(bookShelfCacheKey, vpeResp, RetrivePriceOfferResponse.class, 10, TimeUnit.MINUTES);
+				}
+				if(vpeResp != null){
+					prospectCartServiceImpl.filterSpoIDsbyDeviceSku(vpeResp, prospectFlowData);
+				}
+			}
+		}
+		
+		clearPlansCache(cartRequest);
+
+		if (ProspectCartHelper.isAgentLinkBulkUpload(cartRequest, prospectFlowData) && ObjectUtils.isNotEmpty(prospectFlowData.getCart().getPackages())) {
+			LOGGER.info("Agent link flow");
+			for (Package pkg : prospectFlowData.getCart().getPackages().values()) {
+				if (pkg.isByod()) {
+					pkg.setAlBulkByodPkg(true);
+				}
+			}
+			LOGGER.info("Cart after setting the Bulk upload pkg indicator : {}", gson.toJson(prospectFlowData));
+			prospectCartUtil.saveCartInSession(prospectFlowData);
+		}
+		if(prospectCartUtil.isExistingUserCartMetaInfo(cartRequest.getCartMeta(), prospectFetchConfigHelper.fetchConfigValue(Constants.LOGGEDIN_CLIENT_ID_MBT,Constants.MBT)) && ObjectUtils.isEmpty(prospectFlowData.getCart().getPackages()) && null == resp.getStatus()){
+				ServiceStatus serviceStatus = new ServiceStatus();
+				serviceStatus.setSuccess(true);
+				serviceStatus.setMessage("Cart updated successfully");
+				serviceStatus.setStatusMessage("successfully updated");
+				serviceStatus.setStatusCode(HttpStatus.SC_OK);
+				resp.setStatus(serviceStatus);
+			    resp.setResponse(prospectFlowData);
+		}
+		if(prospectFlowData.isBussComboOrder() && ObjectUtils.isNotEmpty(prospectFlowData.getCart().getPackages()) &&
+				prospectFlowData.getCart().getPackages().values().stream().noneMatch( pkg -> PackageType.IOT.equals(pkg.getPackageType()))){
+			LOGGER.info("Setting BussComboOrder to false");
+			prospectFlowData.setBussComboOrder(false);
+			prospectCartUtil.updateCartInSession(Optional.of(prospectFlowData));
+		}
+		if(!prospectCartUtil.isExistingUserCartMetaInfo(cartRequest.getCartMeta(), prospectFetchConfigHelper.fetchConfigValue(Constants.LOGGEDIN_CLIENT_ID_MBT,Constants.MBT))) {
+			try {
+				ProspectCartHelper.hasAllowedQuantity(cartRequest, prospectFlowData, prospectFetchConfigHelper);
+			} catch (PackageOperationException packageOperationException) {
+				LOGGER.error("Quantity validation failed with exception {}", packageOperationException.getMessage());
+				prospectCartUtil.saveCartInSession(backedUpCart);
+				resp = getCartValidationFailureResponse(backedUpCart, packageOperationException);
+			} catch (Exception e) {
+				LOGGER.error("Quantity validation failed with exception {}", e.getMessage());
+			}
+		}
+		return resp;
+	}
